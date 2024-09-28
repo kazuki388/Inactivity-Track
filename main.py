@@ -1,6 +1,5 @@
 '''
-Discord-Bot-Module template. For detailed usages,
- check https://interactions-py.github.io/interactions.py/
+Inactivity Tracker Module
 
 Copyright (C) 2024  __retr0.init__
 
@@ -18,8 +17,12 @@ You should have received a copy of the GNU General Public License
 along with this program.  If not, see <https://www.gnu.org/licenses/>.
 '''
 import interactions
-# Use the following method to import the internal module in the current same directory
-from . import internal_t
+
+"Highly recommended - we suggest providing proper debug logging"
+from src import logutil
+
+from typing import Optional
+
 # Import the os module to get the parent path to the local files
 import os
 # aiofiles module is recommended for file operation
@@ -29,17 +32,85 @@ from interactions.api.events import MessageCreate
 # You can create a background task
 from interactions import Task, IntervalTrigger
 
+logger = logutil.init_logger(os.path.basename(__file__))
+
+class ChannelHistoryIteractor:
+    def __init__(self, history: interactions.ChannelHistory):
+        self.history: interactions.ChannelHistory = history
+
+    def __aiter__(self):
+        return self
+    
+    async def __anext__(self):
+        try:
+            return await self.history.__anext__()
+        except StopAsyncIteration:
+            raise StopAsyncIteration
+        except interactions.errors.HTTPException as e:
+            try:
+                match int(e.code):
+                    case 50083:
+                        """Operation in archived thread"""
+                        logger.error(f"Channel {self.history.channel.name} ({self.history.channel.id}) is an archived thread")
+                        raise StopAsyncIteration
+                    case 10003:
+                        """Unknown channel"""
+                        logger.error(f"Operating in an unknown channel")
+                        raise StopAsyncIteration
+                    case 10008:
+                        """Unknown message"""
+                        logger.warning(f"Unknown message in Channel {self.history.channel.name} ({self.history.channel.id})")
+                        pass
+                    case 50001:
+                        """No Access"""
+                        logger.error(f"Bot has no access to Channel {self.history.channel.name} ({self.history.channel.id})")
+                        raise StopAsyncIteration
+                    case 50013:
+                        """Lack permission"""
+                        logger.error(f"Channel {self.history.channel.name} ({self.history.channel.id}) lacks permission")
+                        raise StopAsyncIteration
+                    case 50021:
+                        """Cannot execute on system message"""
+                        logger.warning(f"System message in Channel {self.history.channel.name} ({self.history.channel.id})")
+                        pass
+                    case 160005:
+                        """Thread is locked"""
+                        logger.warning(f"Channel {self.history.channel.name} ({self.history.channel.id}) is a locked thread")
+                        pass
+                    case _:
+                        """Default"""
+                        logger.warning(f"Channel {self.history.channel.name} ({self.history.channel.id}) has unknown code {e.code}")
+                        pass
+            except ValueError:
+                logger.warning(f"Unknown HTTP exception {e.code} {e.errors} {e.route} {e.response} {e.text}")
+                pass
+        except Exception as e:
+            logger.warning(f"Unknown exception {e.code} {e.errors} {e.route} {e.response} {e.text}")
+            pass
+
+async def search_latest_msg_ch(user_id: int, channel: interactions.MessageableMixin) -> Optional[interactions.Message]:
+    """
+    Find the latest message of a user in a channel. If no message is found, return None
+    """
+    result: Optional[interactions.Message] = None
+    history: interactions.ChannelHistory = channel.history(0)
+    async for msg in ChannelHistoryIteractor(history=history):
+        if msg.author.id == user_id:
+            result = msg
+            break
+    return result
+
 '''
 Replace the ModuleName with any name you'd like
 '''
-class ModuleName(interactions.Extension):
+class Retr0InitInactivityTrack(interactions.Extension):
     module_base: interactions.SlashCommand = interactions.SlashCommand(
-        name="replace_your_command_base_here",
-        description="Replace here for the base command descriptions"
+        name="inactivity",
+        description="Inactivity tracking module"
     )
     module_group: interactions.SlashCommand = module_base.group(
-        name="replace_your_command_group_here",
-        description="Replace here for the group command descriptions"
+        name="setting",
+        description="Configure the inactivity tracker module"
     )
 
     @module_group.subcommand("ping", sub_cmd_description="Replace the description of this command")
