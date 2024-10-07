@@ -21,7 +21,7 @@ import interactions
 "Highly recommended - we suggest providing proper debug logging"
 from src import logutil
 
-from typing import Optional
+from typing import Optional, cast
 
 # Import the os module to get the parent path to the local files
 import os
@@ -31,6 +31,8 @@ import aiofiles
 from interactions.api.events import MessageCreate
 # You can create a background task
 from interactions import Task, IntervalTrigger
+
+from collections import namedtuple
 
 logger = logutil.init_logger(os.path.basename(__file__))
 
@@ -88,16 +90,56 @@ class ChannelHistoryIteractor:
             logger.warning(f"Unknown exception {e.code} {e.errors} {e.route} {e.response} {e.text}")
             pass
 
-async def search_latest_msg_ch(user_id: int, channel: interactions.MessageableMixin) -> Optional[interactions.Message]:
+# async def search_latest_msg_ch(user_id: int, channel: interactions.MessageableMixin) -> Optional[interactions.Message]:
+#     """
+#     Find the latest message of a user in a channel. If no message is found, return None
+#     """
+#     result: Optional[interactions.Message] = None
+#     history: interactions.ChannelHistory = channel.history(0)
+#     async for msg in ChannelHistoryIteractor(history=history):
+#         if msg.author.id == user_id:
+#             result = msg
+#             break
+#     return result
+
+UserTime = namedtuple("UserTime", "user time")
+
+async def fetch_list_user_latest_msg_ch(channel: interactions.MessageableMixin) -> list[UserTime]:
     """
-    Find the latest message of a user in a channel. If no message is found, return None
+    Get the list of (user, time) for the latest message in a channel
     """
-    result: Optional[interactions.Message] = None
+    result: list[UserTime] = []
     history: interactions.ChannelHistory = channel.history(0)
     async for msg in ChannelHistoryIteractor(history=history):
-        if msg.author.id == user_id:
-            result = msg
-            break
+        if msg.author.id not in (r.user for r in result):
+            tt = msg.edited_timestamp if msg.edited_timestamp else msg.timestamp
+            result.append(UserTime(msg.author.id, tt.timestamp()))
+    return result
+
+async def merge_list_usertime_latest(usertimess: list[list[UserTime]]) -> list[UserTime]:
+    """
+    Merge lists of list of usertime with the latest time
+    """
+    result: list[UserTime] = []
+    found: bool = False
+    for usertimes in usertimess:
+        for ut in usertimes:
+            found = False
+            for i, res_ut in enumerate(result):
+                if ut.user == res_ut.user:
+                    found = True
+                    if ut.time < res_ut.time:
+                        result[i] = res_ut
+                    break
+            if not found:
+                result.append(ut)
+    return result
+
+async def filter_usertime_time(usertimes: list[UserTime], timestamp: float) -> list[UserTime]:
+    """
+    Filter usertime list before (less than) given timestamp
+    """
+    result: list[UserTime] = [usertime for usertime in usertimes if usertime.time < timestamp]
     return result
 
 '''
