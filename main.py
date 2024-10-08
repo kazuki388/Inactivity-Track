@@ -21,7 +21,7 @@ import interactions
 "Highly recommended - we suggest providing proper debug logging"
 from src import logutil
 
-from typing import Optional, cast
+from typing import Optional, cast, Generator
 
 # Import the os module to get the parent path to the local files
 import os
@@ -35,6 +35,23 @@ from interactions import Task, IntervalTrigger
 from collections import namedtuple
 
 logger = logutil.init_logger(os.path.basename(__file__))
+
+"""
+The judge pause period in hour.
+It is like updating the latest time that a user's message every `JUDGING_HOUR` hours.
+It also adds to the judgeing time to temporarily remove roles from the user.
+"""
+JUDGING_HOUR: int = 24
+
+"""
+DB is updated with new values. Need to commit the changes in periodic task
+"""
+DB_updated: bool = False
+
+"""
+Whether the DB is initialised. It's to judge whether all info is aquired for judging and execution
+"""
+data_initialised: bool = False
 
 class ChannelHistoryIteractor:
     def __init__(self, history: interactions.ChannelHistory):
@@ -102,7 +119,9 @@ class ChannelHistoryIteractor:
 #             break
 #     return result
 
-UserTime = namedtuple("UserTime", "user time")
+UserTime = namedtuple("UserTime", "user time index")
+
+Mem_UserTimes: list[UserTime] = []
 
 async def fetch_list_user_latest_msg_ch(channel: interactions.MessageableMixin) -> list[UserTime]:
     """
@@ -113,10 +132,10 @@ async def fetch_list_user_latest_msg_ch(channel: interactions.MessageableMixin) 
     async for msg in ChannelHistoryIteractor(history=history):
         if msg.author.id not in (r.user for r in result):
             tt = msg.edited_timestamp if msg.edited_timestamp else msg.timestamp
-            result.append(UserTime(msg.author.id, tt.timestamp()))
+            result.append(UserTime(msg.author.id, tt.timestamp(), len(result)))
     return result
 
-async def merge_list_usertime_latest(usertimess: list[list[UserTime]]) -> list[UserTime]:
+def merge_list_usertime_latest(usertimess: list[list[UserTime]]) -> list[UserTime]:
     """
     Merge lists of list of usertime with the latest time
     """
@@ -129,18 +148,30 @@ async def merge_list_usertime_latest(usertimess: list[list[UserTime]]) -> list[U
                 if ut.user == res_ut.user:
                     found = True
                     if ut.time < res_ut.time:
-                        result[i] = res_ut
+                        result[i] = UserTime(res_ut.user, res_ut.time, i)
                     break
             if not found:
-                result.append(ut)
+                result.append(UserTime(ut.user, ut.time, len(result)))
     return result
 
-async def filter_usertime_time(usertimes: list[UserTime], timestamp: float) -> list[UserTime]:
+def filter_usertime_time(usertimes: list[UserTime], timestamp: float) -> Generator[UserTime]:
     """
-    Filter usertime list before (less than) given timestamp
+    Filter usertime list before (less than) given timestamp. It skips the JUDGING_HOUR for filtering.
     """
-    result: list[UserTime] = [usertime for usertime in usertimes if usertime.time < timestamp]
+    result: Generator[UserTime] = (usertime for usertime in usertimes if usertime.time < (timestamp - JUDGING_HOUR*60*60))
     return result
+
+"""
+TODO add local database storage support
+TODO record all the taken roles if the user's roles are stripped
+TODO restore the recorded roles to the user if thy sends a message
+TODO validate whether the role still exists before applying them
+TODO add configuration storage
+TODO add startup pickup commands
+TODO add configuration commands
+TODO add status command
+TODO show users to be executed
+"""
 
 '''
 Replace the ModuleName with any name you'd like
@@ -186,6 +217,22 @@ class Retr0InitInactivityTrack(interactions.Extension):
         Event listener when a new message is created
         '''
         print(f"User {event.message.author.display_name} sent '{event.message.content}'")
+        ut: Optional[UserTime] = next((x for x in Mem_UserTimes if x.user == event.message.id), None)
+        if not ut:
+            Mem_UserTimes.append(UserTime(
+                event.message.author.id, 
+                event.message.timestamp.timestamp(),
+                len(Mem_UserTimes)))
+            return
+        if ut.time + JUDGING_HOUR * 3600 <= event.message.timestamp.timestamp():
+            Mem_UserTimes[ut.index] = UserTime(ut.user, event.message.timestamp.timestamp(), ut.index)
+            #TODO Write to database
+    
+    @Task.create(IntervalTrigger(minutes=10))
+    async def task_db_commit(self):
+        if DB_updated:
+            #TODO Commit the DB changes
+            pass
 
     # You can even create a background task to run as you wish.
     # Refer to https://interactions-py.github.io/interactions.py/Guides/40%20Tasks/ for guides

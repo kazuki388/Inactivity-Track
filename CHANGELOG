@@ -1,0 +1,6 @@
+# 20241009
+- Added:
+    - python requirements
+    - database model definition
+    - message listener
+    - database commit background task
