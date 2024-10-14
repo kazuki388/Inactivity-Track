@@ -32,6 +32,7 @@ from interactions.api.events import MessageCreate
 # You can create a background task
 from interactions import Task, IntervalTrigger
 
+import asyncio
 from collections import namedtuple
 
 logger = logutil.init_logger(os.path.basename(__file__))
@@ -52,6 +53,11 @@ DB_updated: bool = False
 Whether the DB is initialised. It's to judge whether all info is aquired for judging and execution
 """
 data_initialised: bool = False
+
+"""
+Currently running role remove tasks. {user_id: task}
+"""
+running_tasks: dict[int, asyncio.Task] = {}
 
 class ChannelHistoryIteractor:
     def __init__(self, history: interactions.ChannelHistory):
@@ -161,6 +167,10 @@ def filter_usertime_time(usertimes: list[UserTime], timestamp: float) -> Generat
     result: Generator[UserTime] = (usertime for usertime in usertimes if usertime.time < (timestamp - JUDGING_HOUR*60*60))
     return result
 
+#TODO upsert usertime into the database
+async def upsert_db_usertime(ut: UserTime) -> None:
+    pass
+
 """
 TODO add local database storage support
 TODO record all the taken roles if the user's roles are stripped
@@ -181,38 +191,80 @@ class Retr0InitInactivityTrack(interactions.Extension):
         name="inactivity",
         description="Inactivity tracking module"
     )
-    module_group: interactions.SlashCommand = module_base.group(
+    module_group_setting: interactions.SlashCommand = module_base.group(
         name="setting",
         description="Configure the inactivity tracker module"
     )
 
-    @module_group.subcommand("ping", sub_cmd_description="Replace the description of this command")
-    @interactions.slash_option(
-        name = "option_name",
-        description = "Option description",
-        required = True,
-        opt_type = interactions.OptionType.STRING
-    )
-    async def module_group_ping(self, ctx: interactions.SlashContext, option_name: str):
-        await ctx.send(f"Pong {option_name}!")
-        internal_t.internal_t_testfunc()
+    info_gathering: bool = False
+    info_gathered: bool = False
+    started: bool = False
+    # The role to be assigned when long-term inactivity
+    role_id_assign: int = 0
+    # The roles not to be executed
+    ignored_roles: list[int] = []
+    # The only roles to be executed. When the length of specific roles is 0, default all roles except the ignored roles
+    specific_roles: list[int] = []
+    # The execution time period in seconds
+    execution_time_second: int = 86400
 
-    @module_base.subcommand("pong", sub_cmd_description="Replace the description of this command")
+    async def execute_member_after_task(self, user_id: int, seconds: int) -> None:
+        try:
+            await asyncio.sleep(seconds)
+            if member := await self.bot.guilds[0].fetch_member(user_id):
+                if len(self.specific_roles) > 0 and all(sr not in member._role_ids for sr in self.specific_roles):
+                    # The user does not have all the specific roles when not all roles are specified
+                    return
+                if any(ir in member._role_ids for ir in self.ignored_roles):
+                    # The user has any of the ignored roles
+                    return
+                if self.role_id_assign not in member._role_ids:
+                    # The user does not have the executed role
+                    member._role_ids #TODO store roles information into DB
+                await member.remove_roles(member.roles, "Inactivity after long period of time")
+                if self.role_id_assign != 0:
+                    await member.add_role(self.role_id_assign)
+        except asyncio.CancelledError:
+            pass
+    
+    def upsert_emat_task(self, user_id: int, seconds: int) -> None:
+        task = asyncio.create_task(self.execute_member_after_task(user_id, seconds))
+        if user_id in running_tasks:
+            running_tasks[user_id].cancel()
+        running_tasks[user_id] = task
+        task.add_done_callback(lambda x:running_tasks.pop(user_id))
+
+    @module_group_setting.subcommand("ping", sub_cmd_description="Replace the description of this command")
     @interactions.slash_option(
         name = "option_name",
         description = "Option description",
         required = True,
         opt_type = interactions.OptionType.STRING
     )
-    async def module_group_pong(self, ctx: interactions.SlashContext, option_name: str):
+    async def module_group_setting_(self, ctx: interactions.SlashContext, option_name: str) -> None:
+        pass
+
+    @module_base.subcommand("status", sub_cmd_description="Get current status and summary")
+    async def module_base_status(self, ctx: interactions.SlashContext):
+        pass
+
+    @module_base.subcommand("start", sub_cmd_description="Replace the description of this command")
+    @interactions.slash_option(
+        name = "option_name",
+        description = "Option description",
+        required = True,
+        opt_type = interactions.OptionType.STRING
+    )
+    async def module_base_start(self, ctx: interactions.SlashContext, option_name: str) -> None:
+        pass
+
+    async def testsetsetset(self) -> None:
         # The local file path is inside the directory of the module's main script file
         async with aiofiles.open(f"{os.path.dirname(__file__)}/example_file.txt") as afp:
             file_content: str = await afp.read()
-        await ctx.send(f"Pong {option_name}!\nFile content: {file_content}")
-        internal_t.internal_t_testfunc()
 
     @interactions.listen(MessageCreate)
-    async def on_messagecreate(self, event: MessageCreate):
+    async def on_messagecreate(self, event: MessageCreate) -> None:
         '''
         Event listener when a new message is created
         '''
@@ -223,13 +275,20 @@ class Retr0InitInactivityTrack(interactions.Extension):
                 event.message.author.id, 
                 event.message.timestamp.timestamp(),
                 len(Mem_UserTimes)))
+            # Write to database
+            await upsert_db_usertime(Mem_UserTimes[-1])
+            # Update and start async task to execute members
+            self.upsert_emat_task(event.message.author.id, self.execution_time_second)
             return
         if ut.time + JUDGING_HOUR * 3600 <= event.message.timestamp.timestamp():
             Mem_UserTimes[ut.index] = UserTime(ut.user, event.message.timestamp.timestamp(), ut.index)
-            #TODO Write to database
+            # Write to database
+            await upsert_db_usertime(Mem_UserTimes[ut.index])
+            # Update and start async task to execute members
+            self.upsert_emat_task(event.message.author.id, self.execution_time_second)
     
     @Task.create(IntervalTrigger(minutes=10))
-    async def task_db_commit(self):
+    async def task_db_commit(self) -> None:
         if DB_updated:
             #TODO Commit the DB changes
             pass
@@ -238,13 +297,13 @@ class Retr0InitInactivityTrack(interactions.Extension):
     # Refer to https://interactions-py.github.io/interactions.py/Guides/40%20Tasks/ for guides
     # Refer to https://interactions-py.github.io/interactions.py/API%20Reference/API%20Reference/models/Internal/tasks/ for detailed APIs
     @Task.create(IntervalTrigger(minutes=1))
-    async def task_everyminute(self):
+    async def task_everyminute(self) -> None:
         channel: interactions.TYPE_MESSAGEABLE_CHANNEL = self.bot.get_guild(1234567890).get_channel(1234567890)
         await channel.send("Background task send every one minute")
         print("Background Task send every one minute")
 
     # The command to start the task
     @module_base.subcommand("start_task", sub_cmd_description="Start the background task")
-    async def module_base_starttask(self, ctx: interactions.SlashContext):
+    async def module_base_starttask(self, ctx: interactions.SlashContext) -> None:
         self.task_everyminute.start()
         await ctx.send("Task started")

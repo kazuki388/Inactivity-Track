@@ -4,3 +4,9 @@
     - database model definition
     - message listener
     - database commit background task
+
+# 20241015
+- Added:
+    - Member execution function draft
+    - Execution task and callbacks
+    - Commands init
