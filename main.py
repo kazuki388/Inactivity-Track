@@ -47,17 +47,27 @@ JUDGING_HOUR: int = 24
 """
 DB is updated with new values. Need to commit the changes in periodic task
 """
-DB_updated: bool = False
+g_DB_updated: bool = False
+
+"""
+Whether the DB is initialising. It's to judge whether the initialising is in process
+"""
+g_data_initialising: bool = False
 
 """
 Whether the DB is initialised. It's to judge whether all info is aquired for judging and execution
 """
-data_initialised: bool = False
+h_data_initialised: asyncio.Event = asyncio.Event()
+
+"""
+A global flag on whether the execution process is started or not
+"""
+g_execution_started: bool = False
 
 """
 Currently running role remove tasks. {user_id: task}
 """
-running_tasks: dict[int, asyncio.Task] = {}
+g_running_tasks: dict[int, asyncio.Task] = {}
 
 class ChannelHistoryIteractor:
     def __init__(self, history: interactions.ChannelHistory):
@@ -171,6 +181,10 @@ def filter_usertime_time(usertimes: list[UserTime], timestamp: float) -> Generat
 async def upsert_db_usertime(ut: UserTime) -> None:
     pass
 
+#TODO execute a single member
+async def execute_member(member: interactions.Member) -> None:
+    pass
+
 """
 TODO add local database storage support
 TODO record all the taken roles if the user's roles are stripped
@@ -208,6 +222,30 @@ class Retr0InitInactivityTrack(interactions.Extension):
     # The execution time period in seconds
     execution_time_second: int = 86400
 
+    async def async_start(self) -> None:
+        """
+        Load all data from database only when the bot starts up
+        If want to do it when loaded after start-up, run `\inactivity init`
+        """
+        pass
+
+    def drop(self) -> None:
+        """Do not modify"""
+        asyncio.create_task(self.async_drop())
+        super().drop()
+    
+    async def async_drop(self) -> None:
+        """
+        Cleanup after the extension is unloaded:
+        - Stop DB commit task
+        - Commit unsaved changes to DB
+        - Close the database connection if connected
+        """
+        self.task_db_commit.stop()
+        await self.func_task_db_commit()
+        #TODO close the database connection
+        pass
+
     async def execute_member_after_task(self, user_id: int, seconds: int) -> None:
         try:
             await asyncio.sleep(seconds)
@@ -229,10 +267,10 @@ class Retr0InitInactivityTrack(interactions.Extension):
     
     def upsert_emat_task(self, user_id: int, seconds: int) -> None:
         task = asyncio.create_task(self.execute_member_after_task(user_id, seconds))
-        if user_id in running_tasks:
-            running_tasks[user_id].cancel()
-        running_tasks[user_id] = task
-        task.add_done_callback(lambda x:running_tasks.pop(user_id))
+        if user_id in g_running_tasks:
+            g_running_tasks[user_id].cancel()
+        g_running_tasks[user_id] = task
+        task.add_done_callback(lambda x:g_running_tasks.pop(user_id))
 
     @module_group_setting.subcommand("ping", sub_cmd_description="Replace the description of this command")
     @interactions.slash_option(
@@ -248,14 +286,72 @@ class Retr0InitInactivityTrack(interactions.Extension):
     async def module_base_status(self, ctx: interactions.SlashContext):
         pass
 
-    @module_base.subcommand("start", sub_cmd_description="Replace the description of this command")
+    async def init_data(self) -> None:
+        """
+        Initiliase and prepare data for this module to operate
+        """
+        global h_data_initialised
+        global g_data_initialising
+        if h_data_initialised.is_set():
+            return
+        g_data_initialising = True
+        #TODO Load data from database
+        # Function cleanup
+        h_data_initialised.set()
+        g_data_initialising = False
+        pass
+
+    @module_base.subcommand("init", sub_cmd_description="Prepare the data. Essential before start.")
+    async def module_base_init(self, ctx: interactions.SlashContext,) -> None:
+        global h_data_initialised
+        if h_data_initialised.is_set():
+            await ctx.send("The data is already initialised!", ephemeral=True)
+            return
+        if g_data_initialising:
+            await ctx.send("The data is being initalised!", ephemeral=True)
+            return
+        # Prepare the data
+        await self.init_data()
+        pass
+
+    @module_base.subcommand("start", sub_cmd_description="Start the member execution only after initialised")
     @interactions.slash_option(
-        name = "option_name",
-        description = "Option description",
-        required = True,
-        opt_type = interactions.OptionType.STRING
+        name = "init_first",
+        description = "Initiliase the data before start.",
+        required = False,
+        opt_type = interactions.OptionType.BOOLEAN
     )
-    async def module_base_start(self, ctx: interactions.SlashContext, option_name: str) -> None:
+    @interactions.slash_option(
+        name = "wait",
+        description = "Wait until data is initialised",
+        required = False,
+        opt_type = interactions.OptionType.BOOLEAN
+    )
+    async def module_base_start(self, ctx: interactions.SlashContext, init_first: bool = False, wait: bool = False) -> None:
+        global g_execution_started
+        if g_execution_started:
+            await ctx.send("The execution process is already started.", ephemeral=True)
+            return
+        if init_first and not h_data_initialised.is_set():
+            await ctx.send("Data is being initliased. Please wait...", ephemeral=True)
+            if not g_data_initialising:
+                await self.init_data()
+            else:
+                # Wait until the h_data_initialised event is set
+                await h_data_initialised.wait()
+        if not init_first and not h_data_initialised.is_set():
+            if not g_data_initialising:
+                await ctx.send("The data is not initialised!", ephemeral=True)
+                return
+            elif wait:
+                await ctx.send("The data is being initialised. Please wait...", ephemeral=True)
+                await h_data_initialised.wait()
+            elif not wait:
+                await ctx.send("The data is being initialised! Do it later or set `wait` to `True`.", ephemeral=True)
+                return
+        self.task_db_commit.start()
+        #TODO do something else?
+        g_execution_started = True
         pass
 
     async def testsetsetset(self) -> None:
@@ -287,11 +383,17 @@ class Retr0InitInactivityTrack(interactions.Extension):
             # Update and start async task to execute members
             self.upsert_emat_task(event.message.author.id, self.execution_time_second)
     
+    async def func_task_db_commit(self) -> None:
+        global g_DB_updated
+        if not g_DB_updated:
+            return
+        #TODO Commit the DB changes
+        # DB is commited. Reset the flag
+        g_DB_updated = False
+
     @Task.create(IntervalTrigger(minutes=10))
     async def task_db_commit(self) -> None:
-        if DB_updated:
-            #TODO Commit the DB changes
-            pass
+        await self.func_task_db_commit()
 
     # You can even create a background task to run as you wish.
     # Refer to https://interactions-py.github.io/interactions.py/Guides/40%20Tasks/ for guides

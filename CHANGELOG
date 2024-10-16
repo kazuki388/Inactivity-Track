@@ -10,3 +10,9 @@
     - Member execution function draft
     - Execution task and callbacks
     - Commands init
+
+# 20241017
+- Added:
+    - Asyncio Event to notify the initialisation process
+    - Placeholder functions for bot start and module drop cases
+    - Create a few esential commands
