@@ -16,3 +16,7 @@
     - Asyncio Event to notify the initialisation process
     - Placeholder functions for bot start and module drop cases
     - Create a few esential commands
+
+# 20241018
+- Added SQLite3 in main (Still something left to do)
+- Fixed some status checking logics

@@ -35,7 +35,34 @@ from interactions import Task, IntervalTrigger
 import asyncio
 from collections import namedtuple
 
+import sqlalchemy
+from sqlalchemy import select as sqlselect
+from sqlalchemy import delete as sqldelete
+from sqlalchemy.ext.asyncio import create_async_engine, AsyncEngine, async_sessionmaker
+import sqlalchemy.dialects.sqlite as sqlite
+
+#TODO Change to `from .model import xxx` for production. This is just for development now
+from model import DBBase, UserTimeDB, StrippedRole, StrippedRoles, StrippedUserDB, ConfigRoles, ConfigDB
+
 logger = logutil.init_logger(os.path.basename(__file__))
+
+"""
+Sqlite3 DB async engine
+"""
+g_engine: AsyncEngine = create_async_engine(f"sqlite+aiosqlite:///{os.path.dirname(__file__)}/inactivity_mon_db.db")
+
+"""
+Sqlalchemy async session
+"""
+g_Session = async_sessionmaker(g_engine)
+
+@sqlalchemy.event.listens_for(g_engine.sync_engine, "connect")
+def do_connect(dbapi_connection, connection_record):
+    dbapi_connection.isolation_level = None
+
+@sqlalchemy.event.listens_for(g_engine.sync_engine, "begin")
+def do_begin(conn):
+    conn.exec_driver_sql("BEGIN")
 
 """
 The judge pause period in hour.
@@ -186,7 +213,6 @@ async def execute_member(member: interactions.Member) -> None:
     pass
 
 """
-TODO add local database storage support
 TODO record all the taken roles if the user's roles are stripped
 TODO restore the recorded roles to the user if thy sends a message
 TODO validate whether the role still exists before applying them
@@ -210,6 +236,9 @@ class Retr0InitInactivityTrack(interactions.Extension):
         description="Configure the inactivity tracker module"
     )
 
+    # asyncio lock
+    lock_db: asyncio.Lock = asyncio.Lock()
+
     info_gathering: bool = False
     info_gathered: bool = False
     started: bool = False
@@ -227,7 +256,7 @@ class Retr0InitInactivityTrack(interactions.Extension):
         Load all data from database only when the bot starts up
         If want to do it when loaded after start-up, run `\inactivity init`
         """
-        pass
+        await self.init_data()
 
     def drop(self) -> None:
         """Do not modify"""
@@ -295,7 +324,12 @@ class Retr0InitInactivityTrack(interactions.Extension):
         if h_data_initialised.is_set():
             return
         g_data_initialising = True
+        async with g_engine.begin() as conn:
+            await conn.run_sync(DBBase.metadata.create_all)
         #TODO Load data from database
+        async with g_Session() as conn:
+            pass
+        #TODO Collect information from guild
         # Function cleanup
         h_data_initialised.set()
         g_data_initialising = False
@@ -380,8 +414,9 @@ class Retr0InitInactivityTrack(interactions.Extension):
             Mem_UserTimes[ut.index] = UserTime(ut.user, event.message.timestamp.timestamp(), ut.index)
             # Write to database
             await upsert_db_usertime(Mem_UserTimes[ut.index])
-            # Update and start async task to execute members
-            self.upsert_emat_task(event.message.author.id, self.execution_time_second)
+            if g_execution_started:
+                # Update and start async task to execute members
+                self.upsert_emat_task(event.message.author.id, self.execution_time_second)
     
     async def func_task_db_commit(self) -> None:
         global g_DB_updated
