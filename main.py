@@ -263,7 +263,7 @@ def filter_usertime_time(
 async def upsert_db_usertime(ut: UserTime) -> None:
     """
     Update or insert a user's latest message timestamp in the database.
-
+    Only executes the operation without committing.
     """
     try:
         async with g_Session() as session:
@@ -280,13 +280,11 @@ async def upsert_db_usertime(ut: UserTime) -> None:
                 # Insert new record
                 session.add(UserTimeDB(user=ut.user, timestamp=ut.time))
 
-            await session.commit()
             global g_DB_updated
             g_DB_updated = True
 
     except Exception as e:
         logger.error(f"Failed to upsert user time for user {ut.user}: {e}")
-        # Optionally rollback on error
         try:
             async with g_Session() as session:
                 await session.rollback()
@@ -343,7 +341,9 @@ async def execute_member(member: interactions.Member) -> None:
                         )
                     )
 
-                await session.commit()
+                global g_DB_updated
+                g_DB_updated = True
+
                 logger.info(
                     f"Stored roles for member {member.display_name} ({member.id}): {stripped_roles.model_dump_json()}"
                 )
@@ -377,26 +377,20 @@ class Retr0InitInactivityTrack(interactions.Extension):
         name="setting", description="Configure the inactivity tracker module"
     )
 
-    # asyncio lock
     lock_db: asyncio.Lock = asyncio.Lock()
 
     info_gathering: bool = False
     info_gathered: bool = False
     started: bool = False
-    # The role to be assigned when long-term inactivity
     role_id_assign: int = 0
-    # The roles not to be executed
     ignored_roles: List[int] = []
-    # The only roles to be executed. When the length of specific roles is 0, default all roles except the ignored roles
     specific_roles: List[int] = []
-    # The execution time period in seconds
     execution_time_second: int = 86400
 
     async def async_start(self) -> None:
-        """
-        Load all data from database only when the bot starts up
-        """
+        """Load all data from database only when the bot starts up"""
         await self.init_data()
+        self.task_db_commit.start()
 
     def drop(self) -> None:
         """Do not modify"""
@@ -406,24 +400,19 @@ class Retr0InitInactivityTrack(interactions.Extension):
     async def async_drop(self) -> None:
         """Cleanup after the extension is unloaded"""
         try:
-            # Stop scheduled tasks
             if hasattr(self, "task_db_commit"):
                 self.task_db_commit.stop()
 
-            # Commit any pending changes
             await self.func_task_db_commit()
 
-            # Cancel running tasks
             for task in g_running_tasks.values():
                 if not task.done():
                     task.cancel()
 
-            # Wait for tasks to complete
             if g_running_tasks:
                 await asyncio.gather(*g_running_tasks.values(), return_exceptions=True)
             g_running_tasks.clear()
 
-            # Close database engine
             await g_engine.dispose()
             logger.info("Database connection closed")
 
@@ -498,10 +487,8 @@ class Retr0InitInactivityTrack(interactions.Extension):
                 name=f"inactivity_check_{user_id}",
             )
 
-            # Store new task
             g_running_tasks[user_id] = task
 
-            # Add cleanup callback
             def cleanup_task(future):
                 if user_id in g_running_tasks:
                     del g_running_tasks[user_id]
@@ -511,27 +498,12 @@ class Retr0InitInactivityTrack(interactions.Extension):
         except Exception as e:
             logger.error(f"Failed to create/update task for user {user_id}: {e}")
 
-    @module_group_setting.subcommand(
-        "ping", sub_cmd_description="Replace the description of this command"
-    )
-    @interactions.slash_option(
-        name="option_name",
-        description="Option description",
-        required=True,
-        opt_type=interactions.OptionType.STRING,
-    )
-    async def module_group_setting_(
-        self, ctx: interactions.SlashContext, option_name: str
-    ) -> None:
-        pass
-
     @module_base.subcommand(
         "status", sub_cmd_description="Get current status and summary"
     )
     async def module_base_status(self, ctx: interactions.SlashContext):
         """Display current status and summary of the inactivity tracker"""
         try:
-            # Collect status information
             status_lines = [
                 "**Inactivity Tracker Status**",
                 f"- Initialization: {'Complete' if h_data_initialised.is_set() else 'Pending'}",
@@ -540,12 +512,10 @@ class Retr0InitInactivityTrack(interactions.Extension):
                 f"- Tracked Users: {len(Mem_UserTimes)}",
             ]
 
-            # Add current time and next execution details
             current_time = datetime.now().timestamp()
             upcoming_executions = []
             for user_id, task in g_running_tasks.items():
                 if not task.done():
-                    # Find user's last activity time
                     user_time = next(
                         (ut for ut in Mem_UserTimes if ut.user == user_id), None
                     )
@@ -557,17 +527,14 @@ class Retr0InitInactivityTrack(interactions.Extension):
                         if hours_remaining > 0:
                             upcoming_executions.append((user_id, hours_remaining))
 
-            # Add upcoming executions if any
             if upcoming_executions:
                 status_lines.append("\n**Next Executions:**")
-                # Sort by time and take top 5
                 upcoming_executions.sort(key=lambda x: x[1])
                 for user_id, hours in upcoming_executions[:5]:
                     status_lines.append(
                         f"- User {user_id}: {hours:.1f} hours remaining"
                     )
 
-            # Add configuration summary
             status_lines.extend(
                 [
                     "\n**Configuration Summary:**",
@@ -578,7 +545,6 @@ class Retr0InitInactivityTrack(interactions.Extension):
                 ]
             )
 
-            # Send status message
             await ctx.send("\n".join(status_lines), ephemeral=True)
 
         except Exception as e:
@@ -593,13 +559,10 @@ class Retr0InitInactivityTrack(interactions.Extension):
         g_data_initialising = True
 
         try:
-            # Create database tables if they don't exist
             async with g_engine.begin() as conn:
                 await conn.run_sync(DBBase.metadata.create_all)
 
-            # Load configuration from database
             async with get_session() as session:
-                # Load configs
                 config_query = await session.execute(sqlselect(ConfigDB))
                 configs = config_query.scalars().all()
 
@@ -616,7 +579,6 @@ class Retr0InitInactivityTrack(interactions.Extension):
                         case "execution_time":
                             self.execution_time_second = int(config.value)
 
-                # Load user times
                 user_times_query = await session.execute(sqlselect(UserTimeDB))
                 user_times = user_times_query.scalars().all()
 
@@ -626,7 +588,6 @@ class Retr0InitInactivityTrack(interactions.Extension):
                     for idx, ut in enumerate(user_times)
                 ]
 
-            # Process inactive users
             current_time = datetime.now().timestamp()
             inactive_users = [
                 ut.user
@@ -675,7 +636,6 @@ class Retr0InitInactivityTrack(interactions.Extension):
         if g_data_initialising:
             await ctx.send("The data is being initalised!", ephemeral=True)
             return
-        # Prepare the data
         await self.init_data()
         pass
 
@@ -709,7 +669,6 @@ class Retr0InitInactivityTrack(interactions.Extension):
             if not g_data_initialising:
                 await self.init_data()
             else:
-                # Wait until the h_data_initialised event is set
                 await h_data_initialised.wait()
         if not init_first and not h_data_initialised.is_set():
             if not g_data_initialising:
@@ -728,17 +687,14 @@ class Retr0InitInactivityTrack(interactions.Extension):
                 return
         self.task_db_commit.start()
 
-        # Initialize tasks for all users in memory
         for ut in Mem_UserTimes:
             current_time = datetime.now().timestamp()
             time_since_last = current_time - ut.time
             remaining_time = max(0, self.execution_time_second - time_since_last)
 
-            # Only create task if user still has remaining time before execution
             if remaining_time > 0:
                 self.upsert_emat_task(ut.user, remaining_time)
 
-        # Set started flag and notify user
         g_execution_started = True
         await ctx.send("Inactivity tracking started successfully!", ephemeral=True)
         pass
@@ -757,10 +713,8 @@ class Retr0InitInactivityTrack(interactions.Extension):
                 f"User {event.message.author.display_name} sent '{event.message.content}'"
             )
 
-            # Check if user has stored roles to restore
             try:
                 async with g_Session() as session:
-                    # Check for stored roles
                     stored_roles = await session.execute(
                         sqlselect(StrippedUserDB).where(
                             StrippedUserDB.user == event.message.author.id
@@ -769,21 +723,17 @@ class Retr0InitInactivityTrack(interactions.Extension):
                     user_roles = stored_roles.scalar_one_or_none()
 
                     if user_roles:
-                        # Parse stored roles
                         stripped_roles = StrippedRoles.model_validate_json(
                             user_roles.roles
                         )
 
-                        # Get member object and guild roles
                         if member := await event.message.guild.fetch_member(
                             event.message.author.id
                         ):
-                            # Get all available guild roles
                             guild_roles = {
                                 role.id: role for role in event.message.guild.roles
                             }
 
-                            # Remove inactivity role if it was assigned
                             if self.role_id_assign != 0:
                                 try:
                                     await member.remove_role(self.role_id_assign)
@@ -792,7 +742,6 @@ class Retr0InitInactivityTrack(interactions.Extension):
                                         f"Failed to remove inactivity role: {e}"
                                     )
 
-                            # Restore original roles that still exist
                             roles_restored = []
                             roles_skipped = []
                             for role in stripped_roles.roles:
@@ -811,7 +760,6 @@ class Retr0InitInactivityTrack(interactions.Extension):
                                     )
                                     roles_skipped.append(role.name)
 
-                            # Log results
                             if roles_restored:
                                 logger.info(
                                     f"Restored roles for user {member.display_name} ({member.id}): {', '.join(roles_restored)}"
@@ -821,7 +769,6 @@ class Retr0InitInactivityTrack(interactions.Extension):
                                     f"Skipped roles for user {member.display_name} ({member.id}): {', '.join(roles_skipped)}"
                                 )
 
-                            # Delete stored roles record
                             await session.execute(
                                 sqldelete(StrippedUserDB).where(
                                     StrippedUserDB.user == event.message.author.id
@@ -833,7 +780,6 @@ class Retr0InitInactivityTrack(interactions.Extension):
                     f"Failed to restore roles for user {event.message.author.id}: {e}"
                 )
 
-            # Update user's last activity time (existing code)
             ut: Optional[UserTime] = next(
                 (x for x in Mem_UserTimes if x.user == event.message.id), None
             )
@@ -845,9 +791,7 @@ class Retr0InitInactivityTrack(interactions.Extension):
                         len(Mem_UserTimes),
                     )
                 )
-                # Write to database
                 await upsert_db_usertime(Mem_UserTimes[-1])
-                # Update and start async task to execute members
                 self.upsert_emat_task(
                     event.message.author.id, self.execution_time_second
                 )
@@ -856,10 +800,8 @@ class Retr0InitInactivityTrack(interactions.Extension):
                 Mem_UserTimes[ut.index] = UserTime(
                     ut.user, event.message.timestamp.timestamp(), ut.index
                 )
-                # Write to database
                 await upsert_db_usertime(Mem_UserTimes[ut.index])
                 if g_execution_started:
-                    # Update and start async task to execute members
                     self.upsert_emat_task(
                         event.message.author.id, self.execution_time_second
                     )
@@ -867,7 +809,13 @@ class Retr0InitInactivityTrack(interactions.Extension):
         except Exception as e:
             logger.error(f"Error processing message event: {e}", exc_info=True)
 
+    @Task.create(IntervalTrigger(minutes=10))
+    async def task_db_commit(self) -> None:
+        """Periodic task to commit database changes if any updates occurred"""
+        await self.func_task_db_commit()
+
     async def func_task_db_commit(self) -> None:
+        """Commit database changes if any updates occurred"""
         global g_DB_updated
         if not g_DB_updated:
             return
@@ -876,21 +824,14 @@ class Retr0InitInactivityTrack(interactions.Extension):
             async with g_Session() as session:
                 await session.commit()
                 logger.debug("Successfully committed database changes")
+                g_DB_updated = False
         except Exception as e:
             logger.error(f"Failed to commit database changes: {e}")
-            # Optionally rollback on error
             try:
                 async with g_Session() as session:
                     await session.rollback()
             except Exception as rollback_error:
                 logger.error(f"Failed to rollback database changes: {rollback_error}")
-        finally:
-            # Reset the flag regardless of success/failure since we attempted to commit
-            g_DB_updated = False
-
-    @Task.create(IntervalTrigger(minutes=10))
-    async def task_db_commit(self) -> None:
-        await self.func_task_db_commit()
 
     @module_group_setting.subcommand(
         "set_role", sub_cmd_description="Set the role to be assigned to inactive users"
@@ -904,10 +845,8 @@ class Retr0InitInactivityTrack(interactions.Extension):
     async def module_group_setting_role(
         self, ctx: interactions.SlashContext, role: Optional[interactions.Role] = None
     ) -> None:
-        """Set the role that will be assigned to inactive users"""
         try:
             async with g_Session() as session:
-                # Check if config exists
                 existing = await session.execute(
                     sqlselect(ConfigDB).where(ConfigDB.name == "role_id_assign")
                 )
@@ -920,7 +859,9 @@ class Retr0InitInactivityTrack(interactions.Extension):
                 else:
                     session.add(ConfigDB(name="role_id_assign", value=role_id))
 
-                await session.commit()
+                global g_DB_updated
+                g_DB_updated = True
+
                 self.role_id_assign = int(role_id)
 
                 if role:
@@ -947,16 +888,8 @@ class Retr0InitInactivityTrack(interactions.Extension):
     async def module_group_setting_ignored(
         self, ctx: interactions.SlashContext, roles: Optional[str] = None
     ) -> None:
-        """Set roles that will be ignored by the inactivity checker"""
         try:
             async with g_Session() as session:
-                # Check if config exists
-                existing = await session.execute(
-                    sqlselect(ConfigDB).where(ConfigDB.name == "ignored_roles")
-                )
-                config = existing.scalar_one_or_none()
-
-                # Parse role IDs from input
                 role_ids = []
                 if roles:
                     try:
@@ -970,16 +903,22 @@ class Retr0InitInactivityTrack(interactions.Extension):
                         )
                         return
 
-                # Create ConfigRoles object and convert to JSON
                 config_roles = ConfigRoles(roles=role_ids)
                 roles_json = config_roles.model_dump_json()
+
+                existing = await session.execute(
+                    sqlselect(ConfigDB).where(ConfigDB.name == "ignored_roles")
+                )
+                config = existing.scalar_one_or_none()
 
                 if config:
                     config.value = roles_json
                 else:
                     session.add(ConfigDB(name="ignored_roles", value=roles_json))
 
-                await session.commit()
+                global g_DB_updated
+                g_DB_updated = True
+
                 self.ignored_roles = role_ids
 
                 if role_ids:
@@ -1007,16 +946,8 @@ class Retr0InitInactivityTrack(interactions.Extension):
     async def module_group_setting_specific(
         self, ctx: interactions.SlashContext, roles: Optional[str] = None
     ) -> None:
-        """Set specific roles to monitor for inactivity"""
         try:
             async with g_Session() as session:
-                # Check if config exists
-                existing = await session.execute(
-                    sqlselect(ConfigDB).where(ConfigDB.name == "specific_roles")
-                )
-                config = existing.scalar_one_or_none()
-
-                # Parse role IDs from input
                 role_ids = []
                 if roles:
                     try:
@@ -1030,16 +961,22 @@ class Retr0InitInactivityTrack(interactions.Extension):
                         )
                         return
 
-                # Create ConfigRoles object and convert to JSON
                 config_roles = ConfigRoles(roles=role_ids)
                 roles_json = config_roles.model_dump_json()
+
+                existing = await session.execute(
+                    sqlselect(ConfigDB).where(ConfigDB.name == "specific_roles")
+                )
+                config = existing.scalar_one_or_none()
 
                 if config:
                     config.value = roles_json
                 else:
                     session.add(ConfigDB(name="specific_roles", value=roles_json))
 
-                await session.commit()
+                global g_DB_updated
+                g_DB_updated = True
+
                 self.specific_roles = role_ids
 
                 if role_ids:
@@ -1074,7 +1011,6 @@ class Retr0InitInactivityTrack(interactions.Extension):
         try:
             seconds = hours * 3600
             async with g_Session() as session:
-                # Check if config exists
                 existing = await session.execute(
                     sqlselect(ConfigDB).where(ConfigDB.name == "execution_time")
                 )
@@ -1085,7 +1021,9 @@ class Retr0InitInactivityTrack(interactions.Extension):
                 else:
                     session.add(ConfigDB(name="execution_time", value=str(seconds)))
 
-                await session.commit()
+                global g_DB_updated
+                g_DB_updated = True
+
                 self.execution_time_second = seconds
 
                 await ctx.send(f"Execution time set to {hours} hours", ephemeral=True)
@@ -1093,6 +1031,35 @@ class Retr0InitInactivityTrack(interactions.Extension):
         except Exception as e:
             logger.error(f"Failed to set execution time: {e}")
             await ctx.send("Failed to set execution time", ephemeral=True)
+
+    @module_group_setting.subcommand(
+        "reset", sub_cmd_description="Reset all configuration to default values"
+    )
+    async def module_group_setting_reset(
+        self,
+        ctx: interactions.SlashContext,
+    ) -> None:
+        """Reset all configuration settings to defaults"""
+        try:
+            async with g_Session() as session:
+                await session.execute(sqldelete(ConfigDB))
+
+                global g_DB_updated
+                g_DB_updated = True
+
+                self.role_id_assign = 0
+                self.ignored_roles = []
+                self.specific_roles = []
+                self.execution_time_second = 86400
+
+                await ctx.send(
+                    "All configuration settings have been reset to defaults",
+                    ephemeral=True,
+                )
+
+        except Exception as e:
+            logger.error(f"Failed to reset configuration: {e}")
+            await ctx.send("Failed to reset configuration settings", ephemeral=True)
 
     @module_base.subcommand(
         "pickup", sub_cmd_description="Check for and process inactive users immediately"
@@ -1115,7 +1082,6 @@ class Retr0InitInactivityTrack(interactions.Extension):
             inactive_users = []
             processed_count = 0
 
-            # Find inactive users
             for ut in Mem_UserTimes:
                 time_since_last = current_time - ut.time
                 if time_since_last >= self.execution_time_second:
@@ -1132,7 +1098,6 @@ class Retr0InitInactivityTrack(interactions.Extension):
             guild = self.bot.guilds[0]
             total = len(inactive_users)
 
-            # Process inactive users
             for user_id in inactive_users:
                 try:
                     if member := await guild.fetch_member(user_id):
@@ -1146,7 +1111,6 @@ class Retr0InitInactivityTrack(interactions.Extension):
                         f"Failed to process inactive member {user_id} during pickup: {e}"
                     )
 
-            # Send results
             await ctx.send(
                 f"Processed {processed_count} out of {total} inactive users.",
                 ephemeral=True,
@@ -1167,7 +1131,6 @@ class Retr0InitInactivityTrack(interactions.Extension):
     ) -> None:
         """Display current configuration settings"""
         try:
-            # Format current settings into a readable message
             settings = [
                 f"**Inactivity Role:** {self.role_id_assign if self.role_id_assign != 0 else 'Disabled'}",
                 f"**Execution Time:** {self.execution_time_second // 3600} hours",
@@ -1182,32 +1145,3 @@ class Retr0InitInactivityTrack(interactions.Extension):
         except Exception as e:
             logger.error(f"Failed to show configuration: {e}")
             await ctx.send("Failed to retrieve configuration settings", ephemeral=True)
-
-    @module_group_setting.subcommand(
-        "reset", sub_cmd_description="Reset all configuration to default values"
-    )
-    async def module_group_setting_reset(
-        self,
-        ctx: interactions.SlashContext,
-    ) -> None:
-        """Reset all configuration settings to defaults"""
-        try:
-            async with g_Session() as session:
-                # Delete all existing config entries
-                await session.execute(sqldelete(ConfigDB))
-                await session.commit()
-
-                # Reset instance variables
-                self.role_id_assign = 0
-                self.ignored_roles = []
-                self.specific_roles = []
-                self.execution_time_second = 86400  # 24 hours
-
-                await ctx.send(
-                    "All configuration settings have been reset to defaults",
-                    ephemeral=True,
-                )
-
-        except Exception as e:
-            logger.error(f"Failed to reset configuration: {e}")
-            await ctx.send("Failed to reset configuration settings", ephemeral=True)
