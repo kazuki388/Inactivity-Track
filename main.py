@@ -20,11 +20,9 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 import asyncio
 import os
 from collections import namedtuple
-from contextlib import asynccontextmanager
 from datetime import datetime
-from typing import Any, Dict, Generator, List, Optional, cast
+from typing import Generator, List, Optional
 
-import aiofiles
 import interactions
 import sqlalchemy
 import sqlalchemy.dialects.sqlite as sqlite
@@ -57,19 +55,31 @@ g_engine: AsyncEngine = create_async_engine(
 """
 Sqlalchemy async session factory with proper connection management
 """
+g_session: Optional[async_sessionmaker] = None
 
 
-@asynccontextmanager
 async def get_session():
-    async with g_Session() as session:
-        try:
-            yield session
-            await session.commit()
-        except Exception:
-            await session.rollback()
-            raise
-        finally:
-            await session.close()
+    """Get or create global session"""
+    global g_session
+    if g_session is not None:
+        return g_session
+    g_session = await g_Session()
+    return g_session
+
+
+async def close_session():
+    """Close and clear the global session"""
+    global g_session
+    if g_session is not None:
+        await g_session.close()
+        g_session = None
+
+
+async def commit_session():
+    """Commit changes in the global session"""
+    global g_session
+    if g_session is not None:
+        await g_session.commit()
 
 
 """
@@ -266,28 +276,24 @@ async def upsert_db_usertime(ut: UserTime) -> None:
     Only executes the operation without committing.
     """
     try:
-        async with g_Session() as session:
-            # Check if user already exists
-            existing = await session.execute(
-                sqlselect(UserTimeDB).where(UserTimeDB.user == ut.user)
-            )
-            user_time = existing.scalar_one_or_none()
+        session = await get_session()
+        existing = await session.execute(
+            sqlselect(UserTimeDB).where(UserTimeDB.user == ut.user)
+        )
+        user_time = existing.scalar_one_or_none()
 
-            if user_time:
-                # Update existing record
-                user_time.timestamp = ut.time
-            else:
-                # Insert new record
-                session.add(UserTimeDB(user=ut.user, timestamp=ut.time))
+        if user_time:
+            user_time.timestamp = ut.time
+        else:
+            session.add(UserTimeDB(user=ut.user, timestamp=ut.time))
 
-            global g_DB_updated
-            g_DB_updated = True
+        global g_DB_updated
+        g_DB_updated = True
 
     except Exception as e:
         logger.error(f"Failed to upsert user time for user {ut.user}: {e}")
         try:
-            async with g_Session() as session:
-                await session.rollback()
+            await session.rollback()
         except Exception as rollback_error:
             logger.error(f"Failed to rollback user time upsert: {rollback_error}")
 
@@ -299,74 +305,70 @@ async def execute_member(member: interactions.Member) -> None:
         logger.error("Could not find Retr0InitInactivityTrack extension")
         return
 
-    async with g_Session() as session:
-        try:
-            # Get user's latest activity time from database
-            result = await session.execute(
-                sqlselect(UserTimeDB).where(UserTimeDB.user == member.id)
+    try:
+        session = await get_session()
+        result = await session.execute(
+            sqlselect(UserTimeDB).where(UserTimeDB.user == member.id)
+        )
+        user_time = result.scalar_one_or_none()
+
+        if not user_time:
+            logger.warning(
+                f"No activity record found for member {member.display_name} ({member.id})"
             )
-            user_time = result.scalar_one_or_none()
+            return
 
-            if not user_time:
-                logger.warning(
-                    f"No activity record found for member {member.display_name} ({member.id})"
-                )
-                return
+        current_time = datetime.now().timestamp()
+        time_since_last_activity = current_time - user_time.timestamp
 
-            current_time = datetime.now().timestamp()
-            time_since_last_activity = current_time - user_time.timestamp
+        if time_since_last_activity >= JUDGING_HOUR * 3600:
+            roles_to_store = [
+                StrippedRole(id=role.id, name=role.name)
+                for role in member.roles
+                if role.id != member.guild.id
+            ]
+            stripped_roles = StrippedRoles(roles=roles_to_store)
 
-            # Check if user has been inactive longer than execution time
-            if time_since_last_activity >= JUDGING_HOUR * 3600:
-                # Store current roles before removing them
-                roles_to_store = [
-                    StrippedRole(id=role.id, name=role.name)
-                    for role in member.roles
-                    if role.id != member.guild.id  # Skip @everyone role
-                ]
-                stripped_roles = StrippedRoles(roles=roles_to_store)
+            existing = await session.execute(
+                sqlselect(StrippedUserDB).where(StrippedUserDB.user == member.id)
+            )
+            user_roles = existing.scalar_one_or_none()
 
-                # Store roles in database
-                existing = await session.execute(
-                    sqlselect(StrippedUserDB).where(StrippedUserDB.user == member.id)
-                )
-                user_roles = existing.scalar_one_or_none()
-
-                if user_roles:
-                    user_roles.roles = stripped_roles.model_dump_json()
-                else:
-                    session.add(
-                        StrippedUserDB(
-                            user=member.id, roles=stripped_roles.model_dump_json()
-                        )
+            if user_roles:
+                user_roles.roles = stripped_roles.model_dump_json()
+            else:
+                session.add(
+                    StrippedUserDB(
+                        user=member.id, roles=stripped_roles.model_dump_json()
                     )
-
-                global g_DB_updated
-                g_DB_updated = True
-
-                logger.info(
-                    f"Stored roles for member {member.display_name} ({member.id}): {stripped_roles.model_dump_json()}"
                 )
 
-                # Remove all roles
-                await member.remove_roles(
-                    member.roles, reason="Inactivity after long period of time"
-                )
+            global g_DB_updated
+            g_DB_updated = True
 
-                # Add inactivity role if configured
-                if extension.role_id_assign != 0:
-                    await member.add_role(extension.role_id_assign)
-
-                logger.info(
-                    f"Executed inactivity actions for member {member.display_name} ({member.id})"
-                )
-
-        except Exception as e:
-            await session.rollback()
-            logger.error(
-                f"Failed to execute member {member.display_name} ({member.id}): {e}"
+            logger.info(
+                f"Stored roles for member {member.display_name} ({member.id}): {stripped_roles.model_dump_json()}"
             )
-            raise
+
+            await member.remove_roles(
+                member.roles, reason="Inactivity after long period of time"
+            )
+
+            if extension.role_id_assign != 0:
+                await member.add_role(extension.role_id_assign)
+
+            logger.info(
+                f"Executed inactivity actions for member {member.display_name} ({member.id})"
+            )
+
+    except Exception as e:
+        logger.error(
+            f"Failed to execute member {member.display_name} ({member.id}): {e}"
+        )
+        try:
+            await session.rollback()
+        except Exception as rollback_error:
+            logger.error(f"Failed to rollback member execution: {rollback_error}")
 
 
 class Retr0InitInactivityTrack(interactions.Extension):
@@ -413,6 +415,8 @@ class Retr0InitInactivityTrack(interactions.Extension):
                 await asyncio.gather(*g_running_tasks.values(), return_exceptions=True)
             g_running_tasks.clear()
 
+            await close_session()
+
             await g_engine.dispose()
             logger.info("Database connection closed")
 
@@ -426,22 +430,18 @@ class Retr0InitInactivityTrack(interactions.Extension):
                 if len(self.specific_roles) > 0 and all(
                     sr not in member._role_ids for sr in self.specific_roles
                 ):
-                    # The user does not have all the specific roles when not all roles are specified
                     return
                 if any(ir in member._role_ids for ir in self.ignored_roles):
-                    # The user has any of the ignored roles
                     return
                 if self.role_id_assign not in member._role_ids:
-                    # Store roles information into DB before removing them
                     roles_to_store = [
                         StrippedRole(id=role.id, name=role.name)
                         for role in member.roles
-                        if role.id != member.guild.id  # Skip @everyone role
+                        if role.id != member.guild.id
                     ]
                     stripped_roles = StrippedRoles(roles=roles_to_store)
 
                     async with g_Session() as session:
-                        # Check if user already exists in DB
                         existing = await session.execute(
                             sqlselect(StrippedUserDB).where(
                                 StrippedUserDB.user == user_id
@@ -458,7 +458,8 @@ class Retr0InitInactivityTrack(interactions.Extension):
                                 )
                             )
 
-                        await session.commit()
+                        global g_DB_updated
+                        g_DB_updated = True
                         logger.info(
                             f"Stored roles for user {user_id}: {stripped_roles.model_dump_json()}"
                         )
@@ -476,12 +477,10 @@ class Retr0InitInactivityTrack(interactions.Extension):
     def upsert_emat_task(self, user_id: int, seconds: int) -> None:
         """Update or create an execution task for a user"""
         try:
-            # Cancel existing task if present
             existing_task = g_running_tasks.get(user_id)
             if existing_task and not existing_task.done():
                 existing_task.cancel()
 
-            # Create new task
             task = asyncio.create_task(
                 self.execute_member_after_task(user_id, seconds),
                 name=f"inactivity_check_{user_id}",
@@ -562,31 +561,31 @@ class Retr0InitInactivityTrack(interactions.Extension):
             async with g_engine.begin() as conn:
                 await conn.run_sync(DBBase.metadata.create_all)
 
-            async with get_session() as session:
-                config_query = await session.execute(sqlselect(ConfigDB))
-                configs = config_query.scalars().all()
+            session = await get_session()
+            config_query = await session.execute(sqlselect(ConfigDB))
+            configs = config_query.scalars().all()
 
-                for config in configs:
-                    match config.name:
-                        case "role_id_assign":
-                            self.role_id_assign = int(config.value)
-                        case "ignored_roles":
-                            roles = ConfigRoles.model_validate_json(config.value)
-                            self.ignored_roles = roles.roles
-                        case "specific_roles":
-                            roles = ConfigRoles.model_validate_json(config.value)
-                            self.specific_roles = roles.roles
-                        case "execution_time":
-                            self.execution_time_second = int(config.value)
+            for config in configs:
+                match config.name:
+                    case "role_id_assign":
+                        self.role_id_assign = int(config.value)
+                    case "ignored_roles":
+                        roles = ConfigRoles.model_validate_json(config.value)
+                        self.ignored_roles = roles.roles
+                    case "specific_roles":
+                        roles = ConfigRoles.model_validate_json(config.value)
+                        self.specific_roles = roles.roles
+                    case "execution_time":
+                        self.execution_time_second = int(config.value)
 
-                user_times_query = await session.execute(sqlselect(UserTimeDB))
-                user_times = user_times_query.scalars().all()
+            user_times_query = await session.execute(sqlselect(UserTimeDB))
+            user_times = user_times_query.scalars().all()
 
-                global Mem_UserTimes
-                Mem_UserTimes = [
-                    UserTime(ut.user, ut.timestamp, idx)
-                    for idx, ut in enumerate(user_times)
-                ]
+            global Mem_UserTimes
+            Mem_UserTimes = [
+                UserTime(ut.user, ut.timestamp, idx)
+                for idx, ut in enumerate(user_times)
+            ]
 
             current_time = datetime.now().timestamp()
             inactive_users = [
@@ -617,6 +616,10 @@ class Retr0InitInactivityTrack(interactions.Extension):
 
         except Exception as e:
             logger.error(f"Failed to initialize data: {e}")
+            try:
+                await session.rollback()
+            except Exception as rollback_error:
+                logger.error(f"Failed to rollback initialization: {rollback_error}")
             raise
         finally:
             h_data_initialised.set()
@@ -714,71 +717,64 @@ class Retr0InitInactivityTrack(interactions.Extension):
             )
 
             try:
-                async with g_Session() as session:
-                    stored_roles = await session.execute(
-                        sqlselect(StrippedUserDB).where(
-                            StrippedUserDB.user == event.message.author.id
-                        )
+                session = await get_session()
+                stored_roles = await session.execute(
+                    sqlselect(StrippedUserDB).where(
+                        StrippedUserDB.user == event.message.author.id
                     )
-                    user_roles = stored_roles.scalar_one_or_none()
+                )
+                user_roles = stored_roles.scalar_one_or_none()
 
-                    if user_roles:
-                        stripped_roles = StrippedRoles.model_validate_json(
-                            user_roles.roles
-                        )
+                if user_roles:
+                    stripped_roles = StrippedRoles.model_validate_json(user_roles.roles)
 
-                        if member := await event.message.guild.fetch_member(
-                            event.message.author.id
-                        ):
-                            guild_roles = {
-                                role.id: role for role in event.message.guild.roles
-                            }
+                    if member := await event.message.guild.fetch_member(
+                        event.message.author.id
+                    ):
+                        guild_roles = {
+                            role.id: role for role in event.message.guild.roles
+                        }
 
-                            if self.role_id_assign != 0:
+                        if self.role_id_assign != 0:
+                            try:
+                                await member.remove_role(self.role_id_assign)
+                            except Exception as e:
+                                logger.warning(f"Failed to remove inactivity role: {e}")
+
+                        roles_restored = []
+                        roles_skipped = []
+                        for role in stripped_roles.roles:
+                            if role.id in guild_roles:
                                 try:
-                                    await member.remove_role(self.role_id_assign)
+                                    await member.add_role(role.id)
+                                    roles_restored.append(role.name)
                                 except Exception as e:
                                     logger.warning(
-                                        f"Failed to remove inactivity role: {e}"
-                                    )
-
-                            roles_restored = []
-                            roles_skipped = []
-                            for role in stripped_roles.roles:
-                                if role.id in guild_roles:
-                                    try:
-                                        await member.add_role(role.id)
-                                        roles_restored.append(role.name)
-                                    except Exception as e:
-                                        logger.warning(
-                                            f"Failed to restore role {role.name} ({role.id}): {e}"
-                                        )
-                                        roles_skipped.append(role.name)
-                                else:
-                                    logger.warning(
-                                        f"Role {role.name} ({role.id}) no longer exists in guild, skipping"
+                                        f"Failed to restore role {role.name} ({role.id}): {e}"
                                     )
                                     roles_skipped.append(role.name)
-
-                            if roles_restored:
-                                logger.info(
-                                    f"Restored roles for user {member.display_name} ({member.id}): {', '.join(roles_restored)}"
-                                )
-                            if roles_skipped:
+                            else:
                                 logger.warning(
-                                    f"Skipped roles for user {member.display_name} ({member.id}): {', '.join(roles_skipped)}"
+                                    f"Role {role.name} ({role.id}) no longer exists in guild, skipping"
                                 )
+                                roles_skipped.append(role.name)
 
-                            await session.execute(
-                                sqldelete(StrippedUserDB).where(
-                                    StrippedUserDB.user == event.message.author.id
-                                )
+                        await session.execute(
+                            sqldelete(StrippedUserDB).where(
+                                StrippedUserDB.user == event.message.author.id
                             )
-                            await session.commit()
+                        )
+                        global g_DB_updated
+                        g_DB_updated = True
+
             except Exception as e:
-                logger.error(
-                    f"Failed to restore roles for user {event.message.author.id}: {e}"
-                )
+                logger.error(f"Failed to process message event: {e}")
+                try:
+                    await session.rollback()
+                except Exception as rollback_error:
+                    logger.error(
+                        f"Failed to rollback message processing: {rollback_error}"
+                    )
 
             ut: Optional[UserTime] = next(
                 (x for x in Mem_UserTimes if x.user == event.message.id), None
@@ -796,6 +792,7 @@ class Retr0InitInactivityTrack(interactions.Extension):
                     event.message.author.id, self.execution_time_second
                 )
                 return
+
             if ut.time + JUDGING_HOUR * 3600 <= event.message.timestamp.timestamp():
                 Mem_UserTimes[ut.index] = UserTime(
                     ut.user, event.message.timestamp.timestamp(), ut.index
@@ -821,15 +818,14 @@ class Retr0InitInactivityTrack(interactions.Extension):
             return
 
         try:
-            async with g_Session() as session:
-                await session.commit()
-                logger.debug("Successfully committed database changes")
-                g_DB_updated = False
+            await commit_session()
+            g_DB_updated = False
+            logger.debug("Successfully committed database changes")
         except Exception as e:
             logger.error(f"Failed to commit database changes: {e}")
             try:
-                async with g_Session() as session:
-                    await session.rollback()
+                session = await get_session()
+                await session.rollback()
             except Exception as rollback_error:
                 logger.error(f"Failed to rollback database changes: {rollback_error}")
 
@@ -846,33 +842,36 @@ class Retr0InitInactivityTrack(interactions.Extension):
         self, ctx: interactions.SlashContext, role: Optional[interactions.Role] = None
     ) -> None:
         try:
-            async with g_Session() as session:
-                existing = await session.execute(
-                    sqlselect(ConfigDB).where(ConfigDB.name == "role_id_assign")
-                )
-                config = existing.scalar_one_or_none()
+            session = await get_session()
+            existing = await session.execute(
+                sqlselect(ConfigDB).where(ConfigDB.name == "role_id_assign")
+            )
+            config = existing.scalar_one_or_none()
 
-                role_id = str(role.id) if role else "0"
+            role_id = str(role.id) if role else "0"
 
-                if config:
-                    config.value = role_id
-                else:
-                    session.add(ConfigDB(name="role_id_assign", value=role_id))
+            if config:
+                config.value = role_id
+            else:
+                session.add(ConfigDB(name="role_id_assign", value=role_id))
 
-                global g_DB_updated
-                g_DB_updated = True
+            global g_DB_updated
+            g_DB_updated = True
 
-                self.role_id_assign = int(role_id)
+            self.role_id_assign = int(role_id)
 
-                if role:
-                    await ctx.send(
-                        f"Inactivity role set to {role.name}", ephemeral=True
-                    )
-                else:
-                    await ctx.send("Inactivity role disabled", ephemeral=True)
+            if role:
+                await ctx.send(f"Inactivity role set to {role.name}", ephemeral=True)
+            else:
+                await ctx.send("Inactivity role disabled", ephemeral=True)
 
         except Exception as e:
             logger.error(f"Failed to set inactivity role: {e}")
+            try:
+                session = await get_session()
+                await session.rollback()
+            except Exception as rollback_error:
+                logger.error(f"Failed to rollback role setting: {rollback_error}")
             await ctx.send("Failed to set inactivity role", ephemeral=True)
 
     @module_group_setting.subcommand(
@@ -889,48 +888,52 @@ class Retr0InitInactivityTrack(interactions.Extension):
         self, ctx: interactions.SlashContext, roles: Optional[str] = None
     ) -> None:
         try:
-            async with g_Session() as session:
-                role_ids = []
-                if roles:
-                    try:
-                        role_ids = [
-                            int(r.strip()) for r in roles.split(",") if r.strip()
-                        ]
-                    except ValueError:
-                        await ctx.send(
-                            "Invalid role ID format. Please use comma-separated numbers.",
-                            ephemeral=True,
-                        )
-                        return
-
-                config_roles = ConfigRoles(roles=role_ids)
-                roles_json = config_roles.model_dump_json()
-
-                existing = await session.execute(
-                    sqlselect(ConfigDB).where(ConfigDB.name == "ignored_roles")
-                )
-                config = existing.scalar_one_or_none()
-
-                if config:
-                    config.value = roles_json
-                else:
-                    session.add(ConfigDB(name="ignored_roles", value=roles_json))
-
-                global g_DB_updated
-                g_DB_updated = True
-
-                self.ignored_roles = role_ids
-
-                if role_ids:
+            session = await get_session()
+            role_ids = []
+            if roles:
+                try:
+                    role_ids = [int(r.strip()) for r in roles.split(",") if r.strip()]
+                except ValueError:
                     await ctx.send(
-                        f"Ignored roles set to: {', '.join(str(r) for r in role_ids)}",
+                        "Invalid role ID format. Please use comma-separated numbers.",
                         ephemeral=True,
                     )
-                else:
-                    await ctx.send("Cleared ignored roles list", ephemeral=True)
+                    return
+
+            config_roles = ConfigRoles(roles=role_ids)
+            roles_json = config_roles.model_dump_json()
+
+            existing = await session.execute(
+                sqlselect(ConfigDB).where(ConfigDB.name == "ignored_roles")
+            )
+            config = existing.scalar_one_or_none()
+
+            if config:
+                config.value = roles_json
+            else:
+                session.add(ConfigDB(name="ignored_roles", value=roles_json))
+
+            global g_DB_updated
+            g_DB_updated = True
+
+            self.ignored_roles = role_ids
+
+            if role_ids:
+                await ctx.send(
+                    f"Ignored roles set to: {', '.join(str(r) for r in role_ids)}",
+                    ephemeral=True,
+                )
+            else:
+                await ctx.send("Cleared ignored roles list", ephemeral=True)
 
         except Exception as e:
             logger.error(f"Failed to set ignored roles: {e}")
+            try:
+                await session.rollback()
+            except Exception as rollback_error:
+                logger.error(
+                    f"Failed to rollback ignored roles setting: {rollback_error}"
+                )
             await ctx.send("Failed to set ignored roles", ephemeral=True)
 
     @module_group_setting.subcommand(
@@ -947,50 +950,52 @@ class Retr0InitInactivityTrack(interactions.Extension):
         self, ctx: interactions.SlashContext, roles: Optional[str] = None
     ) -> None:
         try:
-            async with g_Session() as session:
-                role_ids = []
-                if roles:
-                    try:
-                        role_ids = [
-                            int(r.strip()) for r in roles.split(",") if r.strip()
-                        ]
-                    except ValueError:
-                        await ctx.send(
-                            "Invalid role ID format. Please use comma-separated numbers.",
-                            ephemeral=True,
-                        )
-                        return
-
-                config_roles = ConfigRoles(roles=role_ids)
-                roles_json = config_roles.model_dump_json()
-
-                existing = await session.execute(
-                    sqlselect(ConfigDB).where(ConfigDB.name == "specific_roles")
-                )
-                config = existing.scalar_one_or_none()
-
-                if config:
-                    config.value = roles_json
-                else:
-                    session.add(ConfigDB(name="specific_roles", value=roles_json))
-
-                global g_DB_updated
-                g_DB_updated = True
-
-                self.specific_roles = role_ids
-
-                if role_ids:
+            session = await get_session()
+            role_ids = []
+            if roles:
+                try:
+                    role_ids = [int(r.strip()) for r in roles.split(",") if r.strip()]
+                except ValueError:
                     await ctx.send(
-                        f"Specific roles set to: {', '.join(str(r) for r in role_ids)}",
+                        "Invalid role ID format. Please use comma-separated numbers.",
                         ephemeral=True,
                     )
-                else:
-                    await ctx.send(
-                        "Monitoring all roles (except ignored)", ephemeral=True
-                    )
+                    return
+
+            config_roles = ConfigRoles(roles=role_ids)
+            roles_json = config_roles.model_dump_json()
+
+            existing = await session.execute(
+                sqlselect(ConfigDB).where(ConfigDB.name == "specific_roles")
+            )
+            config = existing.scalar_one_or_none()
+
+            if config:
+                config.value = roles_json
+            else:
+                session.add(ConfigDB(name="specific_roles", value=roles_json))
+
+            global g_DB_updated
+            g_DB_updated = True
+
+            self.specific_roles = role_ids
+
+            if role_ids:
+                await ctx.send(
+                    f"Specific roles set to: {', '.join(str(r) for r in role_ids)}",
+                    ephemeral=True,
+                )
+            else:
+                await ctx.send("Monitoring all roles (except ignored)", ephemeral=True)
 
         except Exception as e:
             logger.error(f"Failed to set specific roles: {e}")
+            try:
+                await session.rollback()
+            except Exception as rollback_error:
+                logger.error(
+                    f"Failed to rollback specific roles setting: {rollback_error}"
+                )
             await ctx.send("Failed to set specific roles", ephemeral=True)
 
     @module_group_setting.subcommand(
@@ -1007,29 +1012,35 @@ class Retr0InitInactivityTrack(interactions.Extension):
     async def module_group_setting_time(
         self, ctx: interactions.SlashContext, hours: int
     ) -> None:
-        """Set the inactivity period before taking action"""
         try:
+            session = await get_session()
             seconds = hours * 3600
-            async with g_Session() as session:
-                existing = await session.execute(
-                    sqlselect(ConfigDB).where(ConfigDB.name == "execution_time")
-                )
-                config = existing.scalar_one_or_none()
 
-                if config:
-                    config.value = str(seconds)
-                else:
-                    session.add(ConfigDB(name="execution_time", value=str(seconds)))
+            existing = await session.execute(
+                sqlselect(ConfigDB).where(ConfigDB.name == "execution_time")
+            )
+            config = existing.scalar_one_or_none()
 
-                global g_DB_updated
-                g_DB_updated = True
+            if config:
+                config.value = str(seconds)
+            else:
+                session.add(ConfigDB(name="execution_time", value=str(seconds)))
 
-                self.execution_time_second = seconds
+            global g_DB_updated
+            g_DB_updated = True
 
-                await ctx.send(f"Execution time set to {hours} hours", ephemeral=True)
+            self.execution_time_second = seconds
+
+            await ctx.send(f"Execution time set to {hours} hours", ephemeral=True)
 
         except Exception as e:
             logger.error(f"Failed to set execution time: {e}")
+            try:
+                await session.rollback()
+            except Exception as rollback_error:
+                logger.error(
+                    f"Failed to rollback execution time setting: {rollback_error}"
+                )
             await ctx.send("Failed to set execution time", ephemeral=True)
 
     @module_group_setting.subcommand(
@@ -1039,26 +1050,31 @@ class Retr0InitInactivityTrack(interactions.Extension):
         self,
         ctx: interactions.SlashContext,
     ) -> None:
-        """Reset all configuration settings to defaults"""
         try:
-            async with g_Session() as session:
-                await session.execute(sqldelete(ConfigDB))
+            session = await get_session()
+            await session.execute(sqldelete(ConfigDB))
 
-                global g_DB_updated
-                g_DB_updated = True
+            global g_DB_updated
+            g_DB_updated = True
 
-                self.role_id_assign = 0
-                self.ignored_roles = []
-                self.specific_roles = []
-                self.execution_time_second = 86400
+            self.role_id_assign = 0
+            self.ignored_roles = []
+            self.specific_roles = []
+            self.execution_time_second = 86400
 
-                await ctx.send(
-                    "All configuration settings have been reset to defaults",
-                    ephemeral=True,
-                )
+            await ctx.send(
+                "All configuration settings have been reset to defaults",
+                ephemeral=True,
+            )
 
         except Exception as e:
             logger.error(f"Failed to reset configuration: {e}")
+            try:
+                await session.rollback()
+            except Exception as rollback_error:
+                logger.error(
+                    f"Failed to rollback configuration reset: {rollback_error}"
+                )
             await ctx.send("Failed to reset configuration settings", ephemeral=True)
 
     @module_base.subcommand(
