@@ -53,37 +53,7 @@ g_engine: AsyncEngine = create_async_engine(
 )
 
 """
-Sqlalchemy async session factory with proper connection management
-"""
-g_session: Optional[async_sessionmaker] = None
-
-
-async def get_session():
-    """Get or create global session"""
-    global g_session
-    if g_session is not None:
-        return g_session
-    g_session = await g_Session()
-    return g_session
-
-
-async def close_session():
-    """Close and clear the global session"""
-    global g_session
-    if g_session is not None:
-        await g_session.close()
-        g_session = None
-
-
-async def commit_session():
-    """Commit changes in the global session"""
-    global g_session
-    if g_session is not None:
-        await g_session.commit()
-
-
-"""
-Sqlalchemy async session
+Sqlalchemy async session factory
 """
 g_Session = async_sessionmaker(g_engine)
 
@@ -96,6 +66,36 @@ def do_connect(dbapi_connection, connection_record):
 @sqlalchemy.event.listens_for(g_engine.sync_engine, "begin")
 def do_begin(conn):
     conn.exec_driver_sql("BEGIN")
+
+
+"""
+Sqlalchemy async session factory with proper connection management
+"""
+g_session: Optional[sqlalchemy.orm.Session] = None
+
+
+async def get_session() -> sqlalchemy.orm.Session:
+    """Get or create global session"""
+    global g_session
+    if g_session:
+        return g_session()
+    g_session = g_Session
+    return g_session()
+
+
+async def close_session():
+    """Close and clear the global session"""
+    global g_session
+    if g_session:
+        await g_session.close()
+        g_session = None
+
+
+async def commit_session():
+    """Commit changes in the global session"""
+    global g_session
+    if g_session:
+        await g_session.commit()
 
 
 """
@@ -350,8 +350,9 @@ async def execute_member(member: interactions.Member) -> None:
                 f"Stored roles for member {member.display_name} ({member.id}): {stripped_roles.model_dump_json()}"
             )
 
+            roles_to_remove = [role.id for role in stripped_roles.roles]
             await member.remove_roles(
-                member.roles, reason="Inactivity after long period of time"
+                roles_to_remove, reason="Inactivity after long period of time"
             )
 
             if extension.role_id_assign != 0:
@@ -434,38 +435,44 @@ class Retr0InitInactivityTrack(interactions.Extension):
                 if any(ir in member._role_ids for ir in self.ignored_roles):
                     return
                 if self.role_id_assign not in member._role_ids:
-                    roles_to_store = [
-                        StrippedRole(id=role.id, name=role.name)
+                    roles_to_remove = [
+                        role
                         for role in member.roles
                         if role.id != member.guild.id
+                        and role.id not in self.ignored_roles
+                        and (not self.specific_roles or role.id in self.specific_roles)
                     ]
-                    stripped_roles = StrippedRoles(roles=roles_to_store)
 
-                    async with g_Session() as session:
-                        existing = await session.execute(
-                            sqlselect(StrippedUserDB).where(
-                                StrippedUserDB.user == user_id
+                    stripped_roles = StrippedRoles(
+                        roles=[
+                            StrippedRole(id=role.id, name=role.name)
+                            for role in roles_to_remove
+                        ]
+                    )
+
+                    session = await get_session()
+                    existing = await session.execute(
+                        sqlselect(StrippedUserDB).where(StrippedUserDB.user == user_id)
+                    )
+                    user_roles = existing.scalar_one_or_none()
+
+                    if user_roles:
+                        user_roles.roles = stripped_roles.model_dump_json()
+                    else:
+                        session.add(
+                            StrippedUserDB(
+                                user=user_id, roles=stripped_roles.model_dump_json()
                             )
                         )
-                        user_roles = existing.scalar_one_or_none()
 
-                        if user_roles:
-                            user_roles.roles = stripped_roles.model_dump_json()
-                        else:
-                            session.add(
-                                StrippedUserDB(
-                                    user=user_id, roles=stripped_roles.model_dump_json()
-                                )
-                            )
-
-                        global g_DB_updated
-                        g_DB_updated = True
-                        logger.info(
-                            f"Stored roles for user {user_id}: {stripped_roles.model_dump_json()}"
-                        )
+                    global g_DB_updated
+                    g_DB_updated = True
+                    logger.info(
+                        f"Stored roles for user {user_id}: {stripped_roles.model_dump_json()}"
+                    )
 
                     await member.remove_roles(
-                        member.roles, "Inactivity after long period of time"
+                        roles_to_remove, "Inactivity after long period of time"
                     )
                     if self.role_id_assign != 0:
                         await member.add_role(self.role_id_assign)
@@ -818,8 +825,10 @@ class Retr0InitInactivityTrack(interactions.Extension):
             return
 
         try:
-            await commit_session()
+            session = await get_session()
+            await session.commit()
             g_DB_updated = False
+            await close_session()
             logger.debug("Successfully committed database changes")
         except Exception as e:
             logger.error(f"Failed to commit database changes: {e}")
