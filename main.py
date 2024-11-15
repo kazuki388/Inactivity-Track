@@ -374,7 +374,9 @@ async def execute_member(member: interactions.Member) -> None:
 
 class Retr0InitInactivityTrack(interactions.Extension):
     module_base: interactions.SlashCommand = interactions.SlashCommand(
-        name="inactivity", description="Inactivity tracking module"
+        name="inactivity",
+        description="Inactivity tracking module",
+        default_member_permissions=interactions.Permissions.ADMINISTRATOR,
     )
     module_group_setting: interactions.SlashCommand = module_base.group(
         name="setting", description="Configure the inactivity tracker module"
